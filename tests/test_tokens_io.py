@@ -58,8 +58,10 @@ def test_casanovo_v5(tmp_path):
     r = reads[0]
     assert r.seq == "PEPMK" and r.conf == [0.9, 0.8, 0.7, 0.6, 0.5]
     assert reads[1].flags == "precursor_mismatch"
-    assert reads[1].weight == 0.5 and math.isclose(reads[1].score, 0.5)
-    assert len(read_casanovo(f, Alphabet(), mismatch_weight=0)) == 1
+    assert math.isclose(reads[1].score, 0.5)
+    assert reads[0].ppm is not None and reads[0].ppm < -10000  # m/z 300.0 is far off
+    kept, st = preprocess(reads, PreprocessParams(min_len=4, min_mean_conf=0.0, precursor_mismatch_weight=0))
+    assert len(kept) == 0 and st["precursor_mismatch"] == 2
 
 
 def test_casanovo_v4_and_reverse(tmp_path):
@@ -140,3 +142,39 @@ def test_per_source_trim_threshold(tmp_path):
     reads[1].conf[-1] = 0.5
     kept, _ = preprocess(reads, PreprocessParams(min_len=4, trim_conf_by_source={"instanovo": 0.6}))
     assert kept[1].seq == "PEPTLDE"
+
+
+def test_masses():
+    from peas.mass import mod_mass, peptide_mass, precursor_ppm
+
+    assert math.isclose(mod_mass("[Oxidation]"), 15.994915)
+    assert math.isclose(mod_mass("+43.006-17.027"), 25.979)
+    assert math.isclose(mod_mass("(+57.02)"), 57.02)
+    assert mod_mass("[Foo]") is None
+    pep = tokenize("PEPTIDEK")
+    m = peptide_mass(pep)
+    assert math.isclose(m, 927.4549, abs_tol=1e-3)
+    mz = (m + 2 * 1.007276) / 2
+    assert abs(precursor_ppm(pep, mz, 2)) < 1e-6
+    # +1 isotope picked: still ~0 ppm
+    assert abs(precursor_ppm(pep, mz + 1.003355 / 2, 2)) < 1e-6
+    # K -> Q swap: ~0.036 Da off
+    assert 30 < abs(precursor_ppm(tokenize("PEPTIDEQ"), mz, 2)) < 50
+    assert precursor_ppm(tokenize("PEPTLDEK"), 0.0, 2) is None
+
+
+def test_agreement_pairs_and_updates():
+    from peas.agreement import AgreementParams, apply_agreement
+    from peas.model import Read
+
+    seqs = ["PEPTLDEK", "AAGGLLK", "WWPPEEK", "MKLLPTR", "QWERTYK"] * 4
+    ca, ins = [], []
+    for i, s in enumerate(seqs):
+        ca.append(Read(f"c{i}", "casanovo", f"c:{i}", s, [0.6] * len(s), 0.5, run="r1", index=i))
+        t = s if i % 5 else s[:-1] + "R"  # every 5th disagrees at the C-terminus
+        ins.append(Read(f"i{i}", "instanovo", f"i:{i}", t, [0.6] * len(t), 0.5, run="r1x", scan=i + 1))
+    st = apply_agreement(ca + ins, AgreementParams(min_identical=5))
+    assert st["paired_spectra"] == len(seqs)
+    assert "[scan-1]" in st["pairings"][0]
+    assert ca[1].conf[0] > 0.6 and ca[1].spectrum == ins[1].spectrum
+    assert ca[0].conf[-1] < 0.6 and ca[0].conf[0] > 0.6

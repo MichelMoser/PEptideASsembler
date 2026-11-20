@@ -69,6 +69,8 @@ Modifications are stripped for assembly by default (`--keep-mods` keeps them as 
 
 1. **Per-residue confidence** `c ∈ [0,1]` is attached to every residue.
 2. **Candidate weighting.** Each spectrum (per tool) contributes one unit of evidence, shared between its candidate peptides (beams / top-n PSMs) in proportion to their peptide probabilities. An ambiguous spectrum therefore counts less toward each interpretation. `--casanovo-weight` and `--instanovo-weight` scale whole tools.
+   - **Precursor mass check.** peas computes the precursor m/z error of *every* candidate itself: InstaNovo beams, and also Casanovo ≥ 5.2, which no longer penalises mismatches. Both the monoisotopic and the +1 isotope peak are tried. Candidates outside `--precursor-tol-ppm` (default 50) get their weight multiplied by `--precursor-mismatch-weight` (default 0.5; 0 drops them). Swapped or mass-equivalent residues (N↔GG) can't be caught this way, but any error that changes the mass is.
+   - **Cross-tool agreement.** Casanovo and InstaNovo predictions of the same spectrum are paired automatically. peas tries every run pairing, identifier type (0-based index, scan number, trailing number of `spectrum_id`) and offset ±1, and keeps the combination with the most identical predictions; the log reports the chosen pairing. Residues on which the tools agree gain confidence, conflicting residues lose it (`--agreement-strength`, default 0.5; `--no-agreement` turns pairing off). Paired predictions share one spectrum ID, so the spectrum is counted once.
 3. **Trimming.** Peptide ends are trimmed with the modified-Mott algorithm, as BWA does for reads (`--trim-method mott`, default). From each end, the cut is placed where the summed deficit `threshold − confidence` of the removed residues is largest. A single confident residue among uncertain ones therefore does not stop trimming, while a confident run is kept. `--trim-method simple` cuts until the first residue above the threshold instead. The threshold is `--trim-conf` (default 0.3). Casanovo scores and InstaNovo probabilities are on different scales, so each tool can get its own threshold with `--casanovo-trim-conf` and `--instanovo-trim-conf`. Uncertain residues in the middle of a peptide are never cut; they are down-weighted instead (steps 4–6).
 4. **Evidence.** Residue evidence = `c × weight`. Identical peptides are collapsed and their evidence summed.
 5. **DBG.** A k-mer occurrence counts with the *minimum* evidence of its residues. Weak k-mers and edges are removed. Branches much weaker than their siblings are cut (`--relative-edge-ratio`).
@@ -130,6 +132,8 @@ The test set is 4 proteins, 1,490 aa in total; two of them are ~87% identical ho
 | + Glu-C | 19 | 0.83 | 0.965 | 194 |
 | Trypsin/Lys-C + proteinase K | 25 | 0.85 | 0.955 | 450 |
 | all four | 35 | 0.89 | 0.964 | 220 |
+
+Precursor check + cross-tool agreement (all four digests, hybrid, 3 seeds): PASS contigs drop from 36–47 to 18–19, identity rises from ~0.95 to ~0.96, and the fraction of contig sequence aligning to the reference rises from 0.90–0.93 to 0.97. Coverage is unchanged within noise (−3 to +1 points). In the simulation the two tools' errors are correlated through a per-spectrum difficulty shared by both.
 
 Main findings:
 - **The assembler doesn't need to know the enzyme.** It only sees overlapping peptides.

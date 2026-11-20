@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from . import __version__
+from .agreement import AgreementParams
 from .assemble import MODES, AssemblyParams, assemble, write_outputs
 from .dbg import DBGParams
 from .evaluate import evaluate
@@ -32,8 +33,7 @@ def cmd_assemble(a: argparse.Namespace) -> int:
     alphabet = Alphabet(strip_mods=not a.keep_mods, merge_il=not a.no_merge_il)
     reads = []
     for f in a.casanovo or []:
-        r = read_casanovo(f, alphabet, reverse_scores=a.casanovo_reverse_scores,
-                          mismatch_weight=a.precursor_mismatch_weight)
+        r = read_casanovo(f, alphabet, reverse_scores=a.casanovo_reverse_scores)
         _log(f"{f}: {len(r)} Casanovo predictions")
         reads += r
     for f in a.instanovo or []:
@@ -43,12 +43,15 @@ def cmd_assemble(a: argparse.Namespace) -> int:
 
     params = AssemblyParams(
         mode=a.mode,
+        agreement=None if a.no_agreement else AgreementParams(strength=a.agreement_strength),
         ks=a.k,
         pre=PreprocessParams(
             min_score=a.min_score, trim_conf=a.trim_conf, trim_method=a.trim_method,
             trim_conf_by_source={k: v for k, v in (("casanovo", a.casanovo_trim_conf),
                                                    ("instanovo", a.instanovo_trim_conf)) if v is not None},
             min_len=a.min_read_len,
+            precursor_tol_ppm=a.precursor_tol_ppm,
+            precursor_mismatch_weight=a.precursor_mismatch_weight,
             min_mean_conf=a.min_mean_conf, max_rank=a.max_rank,
             source_weights={"casanovo": a.casanovo_weight, "instanovo": a.instanovo_weight},
         ),
@@ -68,6 +71,15 @@ def cmd_assemble(a: argparse.Namespace) -> int:
     res = assemble(reads, params)
     write_outputs(res, alphabet, a.output, params)
     st = res.stats
+    ag = st.get("agreement", {})
+    for line in ag.get("pairings", []):
+        _log(f"paired runs: {line}")
+    if ag and not ag.get("pairings"):
+        _log("no Casanovo/InstaNovo run pairing found (different spectra or identifiers?)")
+    pp = st["preprocess"]
+    if pp.get("precursor_ok") or pp.get("precursor_mismatch"):
+        _log(f"precursor check: {pp.get('precursor_ok', 0)} within tolerance, "
+             f"{pp.get('precursor_mismatch', 0)} outside")
     _log(f"reads kept {st['preprocess'].get('kept', 0)}/{st['preprocess'].get('input', 0)}, "
          f"unique sequences {st['units']}, contigs {st['contigs']} ({st['contigs_pass']} PASS) "
          f"({st['assembled_length']} aa), {st['reads_placed']} reads placed; "
@@ -111,8 +123,14 @@ def build_parser() -> argparse.ArgumentParser:
     io.add_argument("--no-merge-il", action="store_true", help="do not merge I and L")
     io.add_argument("--casanovo-reverse-scores", action="store_true",
                     help="aa scores are C->N (Casanovo < 4.3.0)")
+    io.add_argument("--precursor-tol-ppm", type=float, default=50.0,
+                    help="precursor m/z tolerance (isotope 0/+1); computed by peas for every candidate")
     io.add_argument("--precursor-mismatch-weight", type=float, default=0.5,
-                    help="weight of Casanovo predictions failing the precursor filter (0 = drop)")
+                    help="weight multiplier for candidates outside the precursor tolerance (0 = drop)")
+    io.add_argument("--no-agreement", action="store_true",
+                    help="do not pair Casanovo/InstaNovo predictions of the same spectrum")
+    io.add_argument("--agreement-strength", type=float, default=0.5,
+                    help="how strongly cross-tool (dis)agreement changes residue confidence (0-1)")
     io.add_argument("--no-beams", action="store_true", help="use only the top InstaNovo beam")
 
     pre = s.add_argument_group("read filtering / uncertainty")

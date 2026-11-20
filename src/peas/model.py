@@ -25,6 +25,12 @@ class Read:
     weight: float = 1.0
     rank: int = 0
     flags: str = ""
+    # spectrum identity used to match the same spectrum across tools
+    run: str = ""                 # raw file / run name
+    index: int | None = None      # 0-based spectrum index in the run, if known
+    scan: int | None = None       # scan number, if known
+    alt_id: int | None = None     # any other integer id (e.g. trailing number of spectrum_id)
+    ppm: float | None = None      # precursor m/z error of this candidate (computed)
 
     def __post_init__(self) -> None:
         if len(self.seq) != len(self.conf):

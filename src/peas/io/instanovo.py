@@ -23,6 +23,7 @@ import math
 import re
 from pathlib import Path
 
+from ..mass import precursor_ppm
 from ..model import Read
 from ..tokens import Alphabet, Residue, tokenize
 
@@ -32,6 +33,16 @@ TOKLP_COLS = ("token_log_probs", "token_log_probabilities", "token_log_probs_lis
 LP_COLS = ("log_probs", "log_probabilities", "log_prob")
 ID_COLS = ("spectrum_id", "scan_number", "spectrum_index", "id", "index", "prediction_id")
 _BEAM_RE = re.compile(r"^predictions_beam_(\d+)$")
+_TRAIL_RE = re.compile(r"(\d+)\s*$")
+
+
+def _int(s: str | None) -> int | None:
+    if s is None or s == "":
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
 
 
 def _first(columns: list[str], options: tuple[str, ...]) -> str | None:
@@ -131,6 +142,14 @@ def read_instanovo(
         for row_no, row in enumerate(rdr):
             spec = row.get(id_col, "") if id_col else ""
             spectrum = f"{path.stem}:{spec or row_no}"
+            run = row.get("experiment_name") or path.stem
+            index = _int(row.get("spectrum_index")) if "spectrum_index" in row else _int(row.get("index"))
+            scan = _int(row.get("scan_number"))
+            m = _TRAIL_RE.search(row.get("spectrum_id") or "")
+            alt = int(m.group(1)) if m else None
+            prec_mz = _float(row.get("precursor_mz"))
+            charge = _int(row.get("precursor_charge")) or 0
+            tool_ppm = _float(row.get("delta_mass_ppm"))
             cands: list[tuple[list[str], list[float], float]] = []
             if use_beams and beams:
                 for b in beams:
@@ -182,6 +201,9 @@ def read_instanovo(
                     if math.isnan(lp):
                         lp = sum(rlps)
                 score = math.exp(min(0.0, lp)) if not math.isnan(lp) else 0.0
+                ppm = precursor_ppm(residues, prec_mz, charge) if not math.isnan(prec_mz) else None
+                if ppm is None and rank == 0 and not math.isnan(tool_ppm):
+                    ppm = tool_ppm
                 reads.append(
                     Read(
                         id=f"{source}:{spectrum}:{rank}",
@@ -192,6 +214,11 @@ def read_instanovo(
                         score=score,
                         rank=rank,
                         flags=flags,
+                        run=run,
+                        index=index,
+                        scan=scan,
+                        alt_id=alt,
+                        ppm=ppm,
                     )
                 )
     return reads

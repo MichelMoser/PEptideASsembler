@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .agreement import AgreementParams, apply_agreement
 from .dbg import DBG, DBGParams, assemble_dbg
 from .io.fasta import write_fasta
 from .model import Contig, Read, Unit
@@ -22,6 +23,7 @@ class AssemblyParams:
     mode: str = "hybrid"
     ks: list[int] = field(default_factory=lambda: [5])
     pre: PreprocessParams = field(default_factory=PreprocessParams)
+    agreement: AgreementParams | None = field(default_factory=AgreementParams)
     dbg: DBGParams = field(default_factory=DBGParams)
     olc: OLCParams = field(default_factory=OLCParams)
     polish: PolishParams = field(default_factory=PolishParams)
@@ -62,6 +64,8 @@ def assemble(reads: list[Read], params: AssemblyParams) -> AssemblyResult:
     if params.mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     stats: dict = {}
+    if params.agreement is not None and params.agreement.strength > 0:
+        stats["agreement"] = apply_agreement(reads, params.agreement)
     kept, stats["preprocess"] = preprocess(reads, params.pre)
     units = collapse(kept)
     stats["units"] = len(units)

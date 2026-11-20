@@ -25,6 +25,8 @@ class PreprocessParams:
     min_mean_conf: float = 0.4      # drop reads whose mean confidence is lower
     max_rank: int = 4               # keep beams/top-n candidates with rank <= this
     min_candidate_weight: float = 0.05
+    precursor_tol_ppm: float = 50.0     # |ppm| above this = precursor mismatch
+    precursor_mismatch_weight: float = 0.5  # weight multiplier for mismatches (0 = drop)
     source_weights: dict[str, float] | None = None
 
 
@@ -102,6 +104,17 @@ def preprocess(reads: list[Read], p: PreprocessParams) -> tuple[list[Read], dict
     out: list[Read] = []
     for r in reads:
         r.weight *= sw.get(r.source, 1.0)
+        if r.ppm is not None:
+            mismatch = abs(r.ppm) > p.precursor_tol_ppm
+        else:
+            mismatch = "precursor_mismatch" in r.flags
+        if mismatch:
+            stats["precursor_mismatch"] += 1
+            if p.precursor_mismatch_weight <= 0:
+                continue
+            r.weight *= p.precursor_mismatch_weight
+        elif r.ppm is not None:
+            stats["precursor_ok"] += 1
         if r.weight < p.min_candidate_weight:
             stats["low_candidate_weight"] += 1
             continue

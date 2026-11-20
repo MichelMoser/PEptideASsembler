@@ -36,13 +36,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .io.fasta import read_fasta, write_fasta
+from .mass import C13_DELTA, PROTON, peptide_mass
+from .tokens import tokenize
 
 AA_FREQ = {
     "A": 8.25, "R": 5.53, "N": 4.06, "D": 5.45, "C": 1.37, "Q": 3.93, "E": 6.75,
     "G": 7.07, "H": 2.27, "I": 5.96, "L": 9.66, "K": 5.84, "M": 2.42, "F": 3.86,
     "P": 4.70, "S": 6.56, "T": 5.34, "W": 1.08, "Y": 2.92, "V": 6.87,
 }
-SIMILAR = {"K": "Q", "Q": "KE", "N": "D", "D": "N", "E": "Q", "F": "M", "M": "F", "I": "L", "L": "I"}
+# near-isobaric / common confusions; "m" = oxidised methionine (147.0354 vs F 147.0684)
+SIMILAR = {"K": "Q", "Q": "KE", "N": "D", "D": "N", "E": "Q", "F": "m", "m": "F", "I": "L", "L": "I"}
 
 
 @dataclass(frozen=True)
@@ -118,7 +121,10 @@ class SimParams:
     terminal_factor: float = 3.0
     confident_error_frac: float = 0.15
     garbage_rate: float = 0.05
-    oxidation_rate: float = 0.2
+    oxidation_rate: float = 0.2       # per Met, part of the true peptidoform
+    precursor_sd_ppm: float = 3.0     # instrument precursor m/z error
+    isotope_error_rate: float = 0.1   # +1 isotope peak picked as precursor
+    difficulty_sd: float = 0.5        # log-sd of per-spectrum difficulty shared by both tools
     enzyme_noise: dict[str, float] = field(default_factory=dict)  # override Enzyme.noise
 
 
@@ -154,10 +160,16 @@ def _poisson(rng: random.Random, lam: float) -> int:
         k += 1
 
 
-def corrupt(rng: random.Random, pep: str, sp: SimParams, noise: float, miscal: float = 1.0):
-    """Return (residues, confidences) of a simulated prediction."""
+def corrupt(rng: random.Random, pep: str, sp: SimParams, noise: float, miscal: float = 1.0,
+            garbage: bool | None = None):
+    """Return (residues, confidences) of a simulated prediction.
+
+    ``pep`` uses "m" for oxidised Met.  ``garbage`` (decided per spectrum, so
+    shared by both tools) makes the prediction random."""
     aas = list(AA_FREQ)
-    if rng.random() < min(0.5, sp.garbage_rate * noise):
+    if garbage is None:
+        garbage = rng.random() < min(0.5, sp.garbage_rate * noise)
+    if garbage:
         n = max(sp.min_len, len(pep) + rng.randint(-2, 2))
         return [rng.choice(aas) for _ in range(n)], [rng.betavariate(2, 4) for _ in range(n)]
 
@@ -190,16 +202,44 @@ def corrupt(rng: random.Random, pep: str, sp: SimParams, noise: float, miscal: f
     return res, conf
 
 
-def _decorate(res: list[str], rng: random.Random, sp: SimParams, style: str) -> list[str]:
+def _decorate(res: list[str], style: str) -> list[str]:
     out = []
     for a in res:
         if a == "C":
             out.append("C[Carbamidomethyl]" if style == "casanovo" else "C[UNIMOD:4]")
-        elif a == "M" and rng.random() < sp.oxidation_rate:
+        elif a == "m":
             out.append("M[Oxidation]" if style == "casanovo" else "M[UNIMOD:35]")
         else:
             out.append(a)
     return out
+
+
+def _mz(tokens: list[str], charge: int) -> float:
+    mass = peptide_mass(tokenize("".join(tokens)))
+    return (mass + charge * PROTON) / charge
+
+
+@dataclass
+class Spectrum:
+    protein: str
+    start: int
+    peptide: str        # true peptidoform, "m" = oxidised Met
+    charge: int
+    precursor_mz: float
+    difficulty: float
+    garbage: bool
+
+
+def _make_spectrum(rng: random.Random, name: str, start: int, pep: str, sp: SimParams, noise: float) -> Spectrum:
+    pep = "".join("m" if a == "M" and rng.random() < sp.oxidation_rate else a for a in pep)
+    charge = 2 if len(pep) <= 12 else (3 if rng.random() < 0.7 else 2)
+    mz = _mz(_decorate(list(pep), "casanovo"), charge)
+    mz *= 1 + rng.gauss(0, sp.precursor_sd_ppm) * 1e-6
+    if rng.random() < sp.isotope_error_rate:
+        mz += C13_DELTA / charge
+    d = rng.lognormvariate(-sp.difficulty_sd**2 / 2, sp.difficulty_sd)
+    garbage = rng.random() < min(0.5, sp.garbage_rate * noise * d)
+    return Spectrum(name, start, pep, charge, mz, d, garbage)
 
 
 CASANOVO_COLS = [
@@ -208,7 +248,7 @@ CASANOVO_COLS = [
     "calc_mass_to_charge", "spectra_ref", "pre", "post", "start", "end", "opt_global_aa_scores",
     "opt_global_cv_MS:1003169_proforma_peptidoform_sequence",
 ]
-INSTANOVO_COLS = ["spectrum_id", "scan_number", "precursor_mz", "precursor_charge", "prediction_id",
+INSTANOVO_COLS = ["experiment_name", "spectrum_id", "scan_number", "precursor_mz", "precursor_charge", "prediction_id",
                   "predictions", "predictions_tokenised", "log_probs", "token_log_probs", "delta_mass_ppm"]
 for _b in range(2):
     INSTANOVO_COLS += [f"predictions_beam_{_b}", f"predictions_log_probability_beam_{_b}",
@@ -221,13 +261,16 @@ def _write_casanovo(path: Path, spectra, rng, sp: SimParams, enz: Enzyme, noise:
         fh.write(f"MTD\tms_run[1]-location\tfile:///simulated_{enz.name}.mgf\n")
         fh.write("MTD\tsoftware[1]\t[MS, MS:1003281, Casanovo, 5.x-simulated]\n")
         fh.write("PSH\t" + "\t".join(CASANOVO_COLS) + "\n")
-        for i, (_, _, pep) in enumerate(spectra):
-            res, conf = corrupt(rng, pep, sp, noise, enz.miscalibration)
-            toks = _decorate(res, rng, sp, "casanovo")
+        for i, sp_ in enumerate(spectra):
+            res, conf = corrupt(rng, sp_.peptide, sp, noise * sp_.difficulty, enz.miscalibration, sp_.garbage)
+            toks = _decorate(res, "casanovo")
             row = {c: "null" for c in CASANOVO_COLS}
             row.update({
-                "sequence": "".join(res), "PSM_ID": str(i + 1), "search_engine": "[MS, MS:1003281, Casanovo, ]",
-                "search_engine_score[1]": f"{math.prod(conf)}", "charge": "2",
+                "sequence": "".join(res).upper(), "PSM_ID": str(i + 1),
+                "search_engine": "[MS, MS:1003281, Casanovo, ]",
+                "search_engine_score[1]": f"{math.prod(conf)}", "charge": str(sp_.charge),
+                "exp_mass_to_charge": f"{sp_.precursor_mz:.6f}",
+                "calc_mass_to_charge": f"{_mz(toks, sp_.charge):.6f}",
                 "spectra_ref": f"ms_run[1]:index={i}",
                 "opt_global_aa_scores": ",".join(f"{c:.5f}" for c in conf),
                 "opt_global_cv_MS:1003169_proforma_peptidoform_sequence": "".join(toks),
@@ -239,21 +282,25 @@ def _write_instanovo(path: Path, spectra, rng, sp: SimParams, enz: Enzyme, noise
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=INSTANOVO_COLS)
         w.writeheader()
-        for i, (_, _, pep) in enumerate(spectra):
+        for i, sp_ in enumerate(spectra):
             beams = []
             for b in range(2):
-                res, conf = corrupt(rng, pep, sp, noise * (0.8 if b == 0 else 2.0), enz.miscalibration)
+                res, conf = corrupt(rng, sp_.peptide, sp, noise * sp_.difficulty * (0.8 if b == 0 else 2.0),
+                                    enz.miscalibration, sp_.garbage)
                 if b == 1:
                     conf = [c * 0.8 for c in conf]
-                toks = _decorate(res, rng, sp, "instanovo")
+                toks = _decorate(res, "instanovo")
                 beams.append((toks, [math.log(max(c, 1e-6)) for c in conf]))
             beams.sort(key=lambda x: -sum(x[1]))
             toks, lps = beams[0]
+            calc = _mz(toks, sp_.charge)
+            ppm = min(((sp_.precursor_mz - iso * C13_DELTA / sp_.charge - calc) / calc * 1e6 for iso in (0, 1)), key=abs)
             row = {
-                "spectrum_id": f"{enz.name}:{i}", "scan_number": i, "precursor_mz": 0.0,
-                "precursor_charge": 2, "prediction_id": i, "predictions": "".join(toks),
+                "experiment_name": f"simulated_{enz.name}", "spectrum_id": f"simulated_{enz.name}:{i}",
+                "scan_number": i + 1, "precursor_mz": round(sp_.precursor_mz, 6),
+                "precursor_charge": sp_.charge, "prediction_id": i, "predictions": "".join(toks),
                 "predictions_tokenised": ", ".join(toks), "log_probs": sum(lps),
-                "token_log_probs": str([round(x, 5) for x in lps]), "delta_mass_ppm": 0.0,
+                "token_log_probs": str([round(x, 5) for x in lps]), "delta_mass_ppm": round(abs(ppm), 3),
             }
             for b, (bt, bl) in enumerate(beams):
                 row[f"predictions_beam_{b}"] = "".join(bt)
@@ -274,7 +321,7 @@ def simulate(outdir: str | Path, sp: SimParams, reference: str | Path | None = N
 
     info: dict = {"proteins": len(proteins), "enzymes": {}}
     truth = open(outdir / "truth.tsv", "w")
-    truth.write("enzyme\tspectrum_index\tprotein\tstart\tpeptide\n")
+    truth.write("enzyme\tspectrum_index\tprotein\tstart\tpeptide\tcharge\tprecursor_mz\tgarbage\n")
     for ename in sp.enzymes:
         if ename not in ENZYMES:
             raise ValueError(f"unknown enzyme {ename!r}; choose from {sorted(ENZYMES)}")
@@ -296,15 +343,17 @@ def simulate(outdir: str | Path, sp: SimParams, reference: str | Path | None = N
         for (name, start, pep, _), x in zip(peptides, intensity):
             spectra.extend([(name, start, pep)] * _poisson(rng, budget * x / tot))
         rng.shuffle(spectra)
-        for i, (name, start, pep) in enumerate(spectra):
-            truth.write(f"{ename}\t{i}\t{name}\t{start + 1}\t{pep}\n")
+        spectra = [_make_spectrum(rng, n, st, p, sp, noise) for n, st, p in spectra]
+        for i, x in enumerate(spectra):
+            truth.write(f"{ename}\t{i}\t{x.protein}\t{x.start + 1}\t{''.join(_decorate(list(x.peptide), 'casanovo'))}"
+                        f"\t{x.charge}\t{x.precursor_mz:.6f}\t{int(x.garbage)}\n")
         _write_casanovo(outdir / f"casanovo_{ename}.mztab", spectra, rng, sp, enz, noise)
         _write_instanovo(outdir / f"instanovo_{ename}.csv", spectra, rng, sp, enz, noise)
         lens = [len(p[2]) for p in peptides]
         info["enzymes"][ename] = {
             "distinct_peptides": len(peptides),
             "spectra": len(spectra),
-            "peptides_observed": len({(n, st, p) for n, st, p in spectra}),
+            "peptides_observed": len({(x.protein, x.start, x.peptide.upper()) for x in spectra}),
             "median_len": sorted(lens)[len(lens) // 2] if lens else 0,
         }
     truth.close()
