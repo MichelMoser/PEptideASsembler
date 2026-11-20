@@ -45,7 +45,10 @@ def cmd_assemble(a: argparse.Namespace) -> int:
         mode=a.mode,
         ks=a.k,
         pre=PreprocessParams(
-            min_score=a.min_score, trim_conf=a.trim_conf, min_len=a.min_read_len,
+            min_score=a.min_score, trim_conf=a.trim_conf, trim_method=a.trim_method,
+            trim_conf_by_source={k: v for k, v in (("casanovo", a.casanovo_trim_conf),
+                                                   ("instanovo", a.instanovo_trim_conf)) if v is not None},
+            min_len=a.min_read_len,
             min_mean_conf=a.min_mean_conf, max_rank=a.max_rank,
             source_weights={"casanovo": a.casanovo_weight, "instanovo": a.instanovo_weight},
         ),
@@ -114,7 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     pre = s.add_argument_group("read filtering / uncertainty")
     pre.add_argument("--min-score", type=float, default=0.0, help="min peptide score/probability")
-    pre.add_argument("--trim-conf", type=float, default=0.3, help="trim read ends below this residue confidence")
+    pre.add_argument("--trim-conf", type=float, default=0.3, help="residue confidence threshold for end trimming")
+    pre.add_argument("--casanovo-trim-conf", type=float, default=None, help="override --trim-conf for Casanovo")
+    pre.add_argument("--instanovo-trim-conf", type=float, default=None, help="override --trim-conf for InstaNovo")
+    pre.add_argument("--trim-method", choices=["mott", "simple"], default="mott",
+                     help="mott: cut where the summed deficit (thr - conf) is maximal; simple: stop at first good residue")
     pre.add_argument("--min-read-len", type=int, default=6)
     pre.add_argument("--min-mean-conf", type=float, default=0.4)
     pre.add_argument("--max-rank", type=int, default=4, help="max beam/top-n rank used")

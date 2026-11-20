@@ -3,7 +3,7 @@ import math
 import pytest
 
 from peas.io import read_casanovo, read_instanovo
-from peas.preprocess import PreprocessParams, collapse, preprocess, weight_candidates
+from peas.preprocess import PreprocessParams, collapse, preprocess, trim_mott, trim_simple, weight_candidates
 from peas.tokens import Alphabet, Residue, tokenize
 
 
@@ -120,3 +120,23 @@ def test_preprocess_trim_and_collapse(tmp_path):
     units = collapse(kept + [kept[0]])
     assert units[0].seq == "EPTLDEK"
     assert units[1].weight == 2.0
+
+
+def test_trim_simple_vs_mott():
+    conf = [0.1, 0.5, 0.05, 0.1, 0.9, 0.95, 0.9, 0.95, 0.2]
+    assert trim_simple(conf, 0.3) == (1, 8)
+    # mott: removed deficits 0.2-0.2+0.25+0.2 = 0.45 -> cut 4 on the left
+    assert trim_mott(conf, 0.3) == (4, 8)
+    # a confident run outweighs one weak residue
+    assert trim_mott([0.25, 0.9, 0.9, 0.9], 0.3) == (1, 4)
+    assert trim_mott([0.9] * 5, 0.3) == (0, 5)
+    assert trim_mott([0.1] * 5, 0.3) == (5, 5)
+
+
+def test_per_source_trim_threshold(tmp_path):
+    f = tmp_path / "i.csv"
+    f.write_text(INSTANOVO)
+    reads = read_instanovo(f, Alphabet())
+    reads[1].conf[-1] = 0.5
+    kept, _ = preprocess(reads, PreprocessParams(min_len=4, trim_conf_by_source={"instanovo": 0.6}))
+    assert kept[1].seq == "PEPTLDE"

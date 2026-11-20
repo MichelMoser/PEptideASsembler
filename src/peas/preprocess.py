@@ -18,7 +18,9 @@ from .model import Read, Unit
 @dataclass
 class PreprocessParams:
     min_score: float = 0.0          # minimum peptide-level score/probability
-    trim_conf: float = 0.3          # trim terminal residues below this confidence
+    trim_conf: float = 0.3          # trimming threshold on residue confidence
+    trim_conf_by_source: dict[str, float] | None = None  # per-tool override, e.g. {"instanovo": 0.5}
+    trim_method: str = "mott"       # "mott" (best cut point) or "simple" (stop at first good residue)
     min_len: int = 6                # minimum length after trimming
     min_mean_conf: float = 0.4      # drop reads whose mean confidence is lower
     max_rank: int = 4               # keep beams/top-n candidates with rank <= this
@@ -45,14 +47,46 @@ def weight_candidates(reads: list[Read]) -> None:
             r.weight *= max(r.score, 1e-9) / total
 
 
-def trim(read: Read, min_conf: float) -> tuple[int, int]:
-    """Return [start, end) after trimming low-confidence ends."""
-    start, end = 0, len(read.conf)
-    while start < end and read.conf[start] < min_conf:
+def trim_simple(conf: list[float], thr: float) -> tuple[int, int]:
+    """Cut residues from each end until the first one with confidence >= thr."""
+    start, end = 0, len(conf)
+    while start < end and conf[start] < thr:
         start += 1
-    while end > start and read.conf[end - 1] < min_conf:
+    while end > start and conf[end - 1] < thr:
         end -= 1
     return start, end
+
+
+def _best_cut(values) -> int:
+    """Number of leading items maximising the running sum of (thr - conf)."""
+    best, s, cut = 0.0, 0.0, 0
+    for i, v in enumerate(values, 1):
+        s += v
+        if s > best:
+            best, cut = s, i
+    return cut
+
+
+def trim_mott(conf: list[float], thr: float) -> tuple[int, int]:
+    """Modified-Mott trimming (as in BWA / Trimmomatic MAXINFO-like tools).
+
+    From each end, cut at the position that maximises the summed deficit
+    ``thr - conf`` of the removed residues.  A single confident residue
+    between uncertain ones no longer stops trimming, while a confident run
+    outweighs a few uncertain residues before it.
+    """
+    n = len(conf)
+    start = _best_cut(thr - c for c in conf)
+    end = n - _best_cut(thr - conf[i] for i in range(n - 1, start - 1, -1))
+    return start, max(start, end)
+
+
+TRIMMERS = {"mott": trim_mott, "simple": trim_simple}
+
+
+def trim(read: Read, min_conf: float, method: str = "mott") -> tuple[int, int]:
+    """Return [start, end) of the read after trimming its ends."""
+    return TRIMMERS[method](read.conf, min_conf)
 
 
 def preprocess(reads: list[Read], p: PreprocessParams) -> tuple[list[Read], dict[str, int]]:
@@ -60,6 +94,9 @@ def preprocess(reads: list[Read], p: PreprocessParams) -> tuple[list[Read], dict
     stats = defaultdict(int)
     stats["input"] = len(reads)
     sw = p.source_weights or {}
+    tcs = p.trim_conf_by_source or {}
+    if p.trim_method not in TRIMMERS:
+        raise ValueError(f"trim_method must be one of {sorted(TRIMMERS)}")
     reads = [r for r in reads if r.rank <= p.max_rank]
     weight_candidates(reads)
     out: list[Read] = []
@@ -71,7 +108,7 @@ def preprocess(reads: list[Read], p: PreprocessParams) -> tuple[list[Read], dict
         if r.score < p.min_score:
             stats["low_score"] += 1
             continue
-        s, e = trim(r, p.trim_conf)
+        s, e = trim(r, tcs.get(r.source, p.trim_conf), p.trim_method)
         if e - s < p.min_len:
             stats["too_short"] += 1
             continue
