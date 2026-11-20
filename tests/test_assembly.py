@@ -8,7 +8,7 @@ from peas.evaluate import evaluate
 from peas.io import read_casanovo, read_fasta, read_instanovo
 from peas.model import Read, Unit
 from peas.olc import OLCParams, assemble_olc
-from peas.simulate import SimParams, random_protein, simulate
+from peas.simulate import ENZYMES, SimParams, digest, random_protein, simulate
 from peas.tokens import Alphabet
 
 PROTEIN = random_protein(random.Random(42), 120).replace("I", "L")
@@ -61,8 +61,12 @@ def test_dbg_bubble_popped():
 def test_end_to_end_simulation(tmp_path, mode):
     simulate(tmp_path / "sim", SimParams(seed=5, protein_length=200))
     alpha = Alphabet()
-    reads = read_casanovo(tmp_path / "sim/casanovo.mztab", alpha)
-    reads += read_instanovo(tmp_path / "sim/instanovo.csv", alpha)
+    reads = []
+    for f in sorted((tmp_path / "sim").glob("casanovo_*.mztab")):
+        reads += read_casanovo(f, alpha)
+    for f in sorted((tmp_path / "sim").glob("instanovo_*.csv")):
+        reads += read_instanovo(f, alpha)
+    assert {r.spectrum.split(":")[0] for r in reads} >= {"casanovo_proteinase_k", "instanovo_gluc"}
     params = AssemblyParams(mode=mode)
     res = assemble(reads, params)
     write_outputs(res, alpha, tmp_path / "out", params)
@@ -78,3 +82,15 @@ def test_end_to_end_simulation(tmp_path, mode):
 def test_read_length_conf_mismatch_raises():
     with pytest.raises(ValueError):
         Read("x", "s", "sp", "PEP", [1.0], 1.0)
+
+
+def test_digest_rules():
+    prot = "AAAKPAAARPAAAKAAAAFAAAEAAA"
+    tl = ENZYMES["trypsin_lysc"].site_probs(prot)
+    assert tl[4] > 0.9          # K-P is cut (Lys-C)
+    assert tl[9] < 0.01         # R-P is not
+    chy = ENZYMES["chymotrypsin"].site_probs(prot)
+    assert chy[19] >= 0.8       # after F
+    pk = digest(random_protein(random.Random(1), 200), ENZYMES["proteinase_k"], random.Random(2), 50, 7, 30)
+    tr = digest(random_protein(random.Random(1), 200), ENZYMES["trypsin_lysc"], random.Random(2), 50, 7, 30)
+    assert len(pk) > 2 * len(tr)   # unspecific digest -> many more distinct peptides

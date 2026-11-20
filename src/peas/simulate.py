@@ -1,26 +1,38 @@
-"""Simulate de novo peptide predictions with realistic error/confidence profiles.
+"""Simulate multi-protease de novo peptide predictions.
 
-Writes a Casanovo-v5 style mzTab and an InstaNovo-v1 style CSV for the same
-set of simulated spectra, plus the ground truth.  Used for development and
-benchmarking; not a substitute for real data.
+For every digest a Casanovo-v5 style mzTab and an InstaNovo-v1 style CSV
+are written (``casanovo_<enzyme>.mztab``, ``instanovo_<enzyme>.csv``), as
+each digest is normally acquired and sequenced separately, plus the ground
+truth.  Used for development and benchmarking; not a substitute for real
+data.
 
-Error model (per prediction):
+Digestion is **probabilistic**: many protein copies are cut, every bond
+with its own rule-based cleavage probability (incl. missed cleavages,
+low-specificity sites for chymotrypsin, D-cleavage for Glu-C and a broad,
+unspecific proteinase K).  Peptide abundance (and thus the number of
+spectra) follows from how often a peptide is produced, times a random
+detectability factor.
+
+Error model (per prediction), scaled per enzyme because the de novo models
+are trained mostly on tryptic peptides (``Enzyme.noise``):
 
 * I/L reported at random (indistinguishable by mass)
 * substitutions, preferentially near-isobaric (K<->Q, N<->D, Q<->E, F<->M),
-  with mostly low confidence, a fraction confidently wrong
+  mostly with low confidence; a fraction confidently wrong (more often for
+  non-tryptic peptides: worse confidence calibration)
 * adjacent residue swaps (classic de novo error, low confidence)
-* N -> GG / GG -> N (same mass, length changing)
+* N -> GG (same mass, length changing)
 * elevated error rate at the termini
 * occasional garbage predictions (random sequence, low confidence)
 """
 
 from __future__ import annotations
 
+import csv
 import math
 import random
-import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .io.fasta import read_fasta, write_fasta
@@ -32,30 +44,82 @@ AA_FREQ = {
 }
 SIMILAR = {"K": "Q", "Q": "KE", "N": "D", "D": "N", "E": "Q", "F": "M", "M": "F", "I": "L", "L": "I"}
 
-ENZYMES = {
-    "trypsin": (re.compile(r"(?<=[KR])(?!P)"), ),
-    "chymotrypsin": (re.compile(r"(?<=[FWYL])(?!P)"), ),
-    "aspn": (re.compile(r"(?=D)"), ),
-    "gluc": (re.compile(r"(?<=E)"), ),
+
+@dataclass(frozen=True)
+class Rule:
+    """Cleave C-terminal of ``after`` (or N-terminal of ``before``) residues."""
+
+    residues: str
+    prob: float
+    not_before: str = ""     # no cleavage if the next residue is one of these
+    before: bool = False     # rule describes P1' (e.g. Asp-N) instead of P1
+
+
+@dataclass(frozen=True)
+class Enzyme:
+    name: str
+    rules: tuple[Rule, ...]
+    background: float = 0.002   # unspecific cleavage (in-source / contaminating proteases)
+    noise: float = 1.0          # de novo error multiplier for this digest
+    miscalibration: float = 1.0  # multiplier of the confidently-wrong fraction
+
+    def site_probs(self, protein: str) -> list[float]:
+        """Cleavage probability of the bond before position i (i = 1..n-1)."""
+        probs = [0.0] * len(protein)
+        for i in range(1, len(protein)):
+            p1, p1p = protein[i - 1], protein[i]
+            p = self.background
+            for r in self.rules:
+                hit = (p1p in r.residues) if r.before else (p1 in r.residues)
+                if hit and p1p not in r.not_before:
+                    p = max(p, r.prob)
+            probs[i] = p
+        return probs
+
+
+ENZYMES: dict[str, Enzyme] = {
+    # Trypsin/Lys-C mix: Lys-C also cleaves K-P, so K bonds are cut regardless of P
+    "trypsin_lysc": Enzyme("trypsin_lysc", (Rule("K", 0.95), Rule("R", 0.9, not_before="P"))),
+    "trypsin": Enzyme("trypsin", (Rule("KR", 0.9, not_before="P"),)),
+    "lysc": Enzyme("lysc", (Rule("K", 0.95),), noise=1.1),
+    # high specificity F/Y/W, low specificity L/M
+    "chymotrypsin": Enzyme(
+        "chymotrypsin",
+        (Rule("FYW", 0.8, not_before="P"), Rule("LM", 0.3, not_before="P")),
+        noise=1.5, miscalibration=1.5,
+    ),
+    # Glu-C: E (bicarbonate); D at lower rate (phosphate buffer activity)
+    "gluc": Enzyme("gluc", (Rule("E", 0.85, not_before="P"), Rule("D", 0.15, not_before="P")),
+                   noise=1.5, miscalibration=1.5),
+    "aspn": Enzyme("aspn", (Rule("D", 0.85, before=True),), noise=1.5, miscalibration=1.5),
+    # proteinase K: broad, prefers aliphatic/aromatic P1; effectively unspecific
+    "proteinase_k": Enzyme(
+        "proteinase_k",
+        (Rule("AVLIFYWM", 0.3), Rule("GSTCNQ", 0.08)),
+        background=0.03, noise=2.0, miscalibration=2.0,
+    ),
 }
+
+DEFAULT_ENZYMES = ("trypsin_lysc", "chymotrypsin", "gluc", "proteinase_k")
 
 
 @dataclass
 class SimParams:
     seed: int = 1
     protein_length: int = 300
-    enzymes: tuple[str, ...] = ("trypsin", "chymotrypsin", "aspn", "gluc")
-    missed_cleavages: int = 2
-    min_len: int = 7
+    enzymes: tuple[str, ...] = DEFAULT_ENZYMES
+    copies: int = 200                 # protein molecules digested per enzyme
+    min_len: int = 7                  # detectable peptide length range
     max_len: int = 30
-    mean_spectra_per_peptide: float = 3.0
-    nonspecific_peptides: int = 40
+    spectra_per_residue: float = 1.5  # spectrum budget per digest = this x total protein length
+    max_peptides_per_enzyme: int | None = None
     sub_rate: float = 0.04
     swap_rate: float = 0.015
     terminal_factor: float = 3.0
     confident_error_frac: float = 0.15
     garbage_rate: float = 0.05
     oxidation_rate: float = 0.2
+    enzyme_noise: dict[str, float] = field(default_factory=dict)  # override Enzyme.noise
 
 
 def random_protein(rng: random.Random, length: int) -> str:
@@ -63,19 +127,25 @@ def random_protein(rng: random.Random, length: int) -> str:
     return "M" + "".join(rng.choices(aas, weights=w, k=length - 1))
 
 
-def digest(protein: str, enzyme: str, missed: int, min_len: int, max_len: int) -> list[tuple[int, str]]:
-    sites = [0] + [m.start() for m in ENZYMES[enzyme][0].finditer(protein) if 0 < m.start() < len(protein)] + [len(protein)]
-    sites = sorted(set(sites))
-    peps = []
-    for i in range(len(sites) - 1):
-        for j in range(i + 1, min(i + 2 + missed, len(sites))):
-            a, b = sites[i], sites[j]
-            if min_len <= b - a <= max_len:
-                peps.append((a, protein[a:b]))
-    return peps
+def digest(protein: str, enzyme: Enzyme, rng: random.Random, copies: int,
+           min_len: int, max_len: int) -> Counter:
+    """Digest ``copies`` molecules; return Counter of (start, peptide)."""
+    probs = enzyme.site_probs(protein)
+    counts: Counter = Counter()
+    n = len(protein)
+    for _ in range(copies):
+        start = 0
+        for i in range(1, n + 1):
+            if i == n or rng.random() < probs[i]:
+                if min_len <= i - start <= max_len:
+                    counts[(start, protein[start:i])] += 1
+                start = i
+    return counts
 
 
 def _poisson(rng: random.Random, lam: float) -> int:
+    if lam > 30:
+        return max(0, round(rng.gauss(lam, math.sqrt(lam))))
     l, k, p = math.exp(-lam), 0, 1.0
     while True:
         p *= rng.random()
@@ -84,34 +154,34 @@ def _poisson(rng: random.Random, lam: float) -> int:
         k += 1
 
 
-def corrupt(rng: random.Random, pep: str, sp: SimParams, tool_noise: float):
+def corrupt(rng: random.Random, pep: str, sp: SimParams, noise: float, miscal: float = 1.0):
     """Return (residues, confidences) of a simulated prediction."""
     aas = list(AA_FREQ)
-    if rng.random() < sp.garbage_rate:
+    if rng.random() < min(0.5, sp.garbage_rate * noise):
         n = max(sp.min_len, len(pep) + rng.randint(-2, 2))
         return [rng.choice(aas) for _ in range(n)], [rng.betavariate(2, 4) for _ in range(n)]
 
     res = [("L" if a in "IL" and rng.random() < 0.5 else ("I" if a in "IL" else a)) for a in pep]
     conf = [rng.betavariate(12, 1) for _ in res]
     n = len(res)
+    conf_err = min(0.9, sp.confident_error_frac * miscal)
     i = 0
     while i < n:
         term = sp.terminal_factor if (i < 2 or i >= n - 2) else 1.0
         r = rng.random()
-        if r < sp.sub_rate * term * tool_noise:
+        if r < sp.sub_rate * term * noise:
             a = res[i]
             if a in SIMILAR and rng.random() < 0.6:
                 res[i] = rng.choice(SIMILAR[a])
             else:
                 res[i] = rng.choice([x for x in aas if x != a])
-            conf[i] = rng.betavariate(9, 2) if rng.random() < sp.confident_error_frac else rng.betavariate(2, 3)
-        elif r < (sp.sub_rate + sp.swap_rate) * term * tool_noise and i < n - 1 and res[i] != res[i + 1]:
+            conf[i] = rng.betavariate(9, 2) if rng.random() < conf_err else rng.betavariate(2, 3)
+        elif r < (sp.sub_rate + sp.swap_rate) * term * noise and i < n - 1 and res[i] != res[i + 1]:
             res[i], res[i + 1] = res[i + 1], res[i]
             conf[i], conf[i + 1] = rng.betavariate(2, 3), rng.betavariate(2, 3)
             i += 1
         i += 1
-    # mass-equivalent length changes (rare)
-    if rng.random() < 0.02 * tool_noise:
+    if rng.random() < 0.02 * noise:  # mass-equivalent length change
         idx = [j for j, a in enumerate(res) if a == "N"]
         if idx:
             j = rng.choice(idx)
@@ -138,6 +208,58 @@ CASANOVO_COLS = [
     "calc_mass_to_charge", "spectra_ref", "pre", "post", "start", "end", "opt_global_aa_scores",
     "opt_global_cv_MS:1003169_proforma_peptidoform_sequence",
 ]
+INSTANOVO_COLS = ["spectrum_id", "scan_number", "precursor_mz", "precursor_charge", "prediction_id",
+                  "predictions", "predictions_tokenised", "log_probs", "token_log_probs", "delta_mass_ppm"]
+for _b in range(2):
+    INSTANOVO_COLS += [f"predictions_beam_{_b}", f"predictions_log_probability_beam_{_b}",
+                       f"predictions_token_log_probabilities_beam_{_b}"]
+
+
+def _write_casanovo(path: Path, spectra, rng, sp: SimParams, enz: Enzyme, noise: float) -> None:
+    with open(path, "w") as fh:
+        fh.write("MTD\tmzTab-version\t1.0.0\nMTD\tmzTab-mode\tSummary\nMTD\tmzTab-type\tIdentification\n")
+        fh.write(f"MTD\tms_run[1]-location\tfile:///simulated_{enz.name}.mgf\n")
+        fh.write("MTD\tsoftware[1]\t[MS, MS:1003281, Casanovo, 5.x-simulated]\n")
+        fh.write("PSH\t" + "\t".join(CASANOVO_COLS) + "\n")
+        for i, (_, _, pep) in enumerate(spectra):
+            res, conf = corrupt(rng, pep, sp, noise, enz.miscalibration)
+            toks = _decorate(res, rng, sp, "casanovo")
+            row = {c: "null" for c in CASANOVO_COLS}
+            row.update({
+                "sequence": "".join(res), "PSM_ID": str(i + 1), "search_engine": "[MS, MS:1003281, Casanovo, ]",
+                "search_engine_score[1]": f"{math.prod(conf)}", "charge": "2",
+                "spectra_ref": f"ms_run[1]:index={i}",
+                "opt_global_aa_scores": ",".join(f"{c:.5f}" for c in conf),
+                "opt_global_cv_MS:1003169_proforma_peptidoform_sequence": "".join(toks),
+            })
+            fh.write("PSM\t" + "\t".join(row[c] for c in CASANOVO_COLS) + "\n")
+
+
+def _write_instanovo(path: Path, spectra, rng, sp: SimParams, enz: Enzyme, noise: float) -> None:
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=INSTANOVO_COLS)
+        w.writeheader()
+        for i, (_, _, pep) in enumerate(spectra):
+            beams = []
+            for b in range(2):
+                res, conf = corrupt(rng, pep, sp, noise * (0.8 if b == 0 else 2.0), enz.miscalibration)
+                if b == 1:
+                    conf = [c * 0.8 for c in conf]
+                toks = _decorate(res, rng, sp, "instanovo")
+                beams.append((toks, [math.log(max(c, 1e-6)) for c in conf]))
+            beams.sort(key=lambda x: -sum(x[1]))
+            toks, lps = beams[0]
+            row = {
+                "spectrum_id": f"{enz.name}:{i}", "scan_number": i, "precursor_mz": 0.0,
+                "precursor_charge": 2, "prediction_id": i, "predictions": "".join(toks),
+                "predictions_tokenised": ", ".join(toks), "log_probs": sum(lps),
+                "token_log_probs": str([round(x, 5) for x in lps]), "delta_mass_ppm": 0.0,
+            }
+            for b, (bt, bl) in enumerate(beams):
+                row[f"predictions_beam_{b}"] = "".join(bt)
+                row[f"predictions_log_probability_beam_{b}"] = sum(bl)
+                row[f"predictions_token_log_probabilities_beam_{b}"] = str([round(x, 5) for x in bl])
+            w.writerow(row)
 
 
 def simulate(outdir: str | Path, sp: SimParams, reference: str | Path | None = None) -> dict:
@@ -150,80 +272,40 @@ def simulate(outdir: str | Path, sp: SimParams, reference: str | Path | None = N
         proteins = [("sim_protein_1", random_protein(rng, sp.protein_length))]
     write_fasta(outdir / "reference.fasta", proteins)
 
-    peptides: list[tuple[str, int, str]] = []
-    for name, prot in proteins:
-        seen = set()
-        for enz in sp.enzymes:
-            for start, pep in digest(prot, enz, sp.missed_cleavages, sp.min_len, sp.max_len):
-                if (start, pep) not in seen:
-                    seen.add((start, pep))
-                    peptides.append((name, start, pep))
-        for _ in range(sp.nonspecific_peptides):
-            L = rng.randint(sp.min_len, min(sp.max_len, 20))
-            s = rng.randint(0, max(0, len(prot) - L))
-            peptides.append((name, s, prot[s : s + L]))
-
-    spectra = []
-    for name, start, pep in peptides:
-        for _ in range(_poisson(rng, sp.mean_spectra_per_peptide)):
-            spectra.append((name, start, pep))
-    rng.shuffle(spectra)
-
-    with open(outdir / "truth.tsv", "w") as fh:
-        fh.write("spectrum_index\tprotein\tstart\tpeptide\n")
+    info: dict = {"proteins": len(proteins), "enzymes": {}}
+    truth = open(outdir / "truth.tsv", "w")
+    truth.write("enzyme\tspectrum_index\tprotein\tstart\tpeptide\n")
+    for ename in sp.enzymes:
+        if ename not in ENZYMES:
+            raise ValueError(f"unknown enzyme {ename!r}; choose from {sorted(ENZYMES)}")
+        enz = ENZYMES[ename]
+        noise = sp.enzyme_noise.get(ename, enz.noise)
+        peptides: list[tuple[str, int, str, int]] = []
+        for name, prot in proteins:
+            for (start, pep), c in digest(prot, enz, rng, sp.copies, sp.min_len, sp.max_len).items():
+                peptides.append((name, start, pep, c))
+        if sp.max_peptides_per_enzyme and len(peptides) > sp.max_peptides_per_enzyme:
+            peptides.sort(key=lambda x: -x[3])
+            peptides = peptides[: sp.max_peptides_per_enzyme]
+        # equal spectrum budget per digest (one LC-MS run each), spread over
+        # peptides by abundance x random detectability
+        budget = sp.spectra_per_residue * sum(len(p) for _, p in proteins)
+        intensity = [c * rng.lognormvariate(0, 0.7) for *_, c in peptides]
+        tot = sum(intensity) or 1.0
+        spectra = []
+        for (name, start, pep, _), x in zip(peptides, intensity):
+            spectra.extend([(name, start, pep)] * _poisson(rng, budget * x / tot))
+        rng.shuffle(spectra)
         for i, (name, start, pep) in enumerate(spectra):
-            fh.write(f"{i}\t{name}\t{start + 1}\t{pep}\n")
-
-    # Casanovo v5 mzTab
-    with open(outdir / "casanovo.mztab", "w") as fh:
-        fh.write("MTD\tmzTab-version\t1.0.0\nMTD\tmzTab-mode\tSummary\nMTD\tmzTab-type\tIdentification\n")
-        fh.write("MTD\tms_run[1]-location\tfile:///simulated.mgf\n")
-        fh.write("MTD\tsoftware[1]\t[MS, MS:1003281, Casanovo, 5.x-simulated]\n")
-        fh.write("PSH\t" + "\t".join(CASANOVO_COLS) + "\n")
-        for i, (name, start, pep) in enumerate(spectra):
-            res, conf = corrupt(rng, pep, sp, tool_noise=1.0)
-            toks = _decorate(res, rng, sp, "casanovo")
-            score = math.prod(conf)
-            row = {c: "null" for c in CASANOVO_COLS}
-            row.update({
-                "sequence": "".join(res), "PSM_ID": str(i + 1), "search_engine": "[MS, MS:1003281, Casanovo, ]",
-                "search_engine_score[1]": f"{score}", "charge": "2", "spectra_ref": f"ms_run[1]:index={i}",
-                "opt_global_aa_scores": ",".join(f"{c:.5f}" for c in conf),
-                "opt_global_cv_MS:1003169_proforma_peptidoform_sequence": "".join(toks),
-            })
-            fh.write("PSM\t" + "\t".join(row[c] for c in CASANOVO_COLS) + "\n")
-
-    # InstaNovo v1 CSV with 2 beams
-    import csv
-
-    with open(outdir / "instanovo.csv", "w", newline="") as fh:
-        cols = ["spectrum_id", "scan_number", "precursor_mz", "precursor_charge", "prediction_id",
-                "predictions", "predictions_tokenised", "log_probs", "token_log_probs", "delta_mass_ppm"]
-        for b in range(2):
-            cols += [f"predictions_beam_{b}", f"predictions_log_probability_beam_{b}",
-                     f"predictions_token_log_probabilities_beam_{b}"]
-        w = csv.DictWriter(fh, fieldnames=cols)
-        w.writeheader()
-        for i, (name, start, pep) in enumerate(spectra):
-            beams = []
-            for b in range(2):
-                res, conf = corrupt(rng, pep, sp, tool_noise=0.8 if b == 0 else 2.0)
-                if b == 1:
-                    conf = [c * 0.8 for c in conf]
-                toks = _decorate(res, rng, sp, "instanovo")
-                lps = [math.log(max(c, 1e-6)) for c in conf]
-                beams.append((toks, lps))
-            beams.sort(key=lambda x: -sum(x[1]))
-            toks, lps = beams[0]
-            row = {
-                "spectrum_id": f"simulated:{i}", "scan_number": i, "precursor_mz": 0.0, "precursor_charge": 2,
-                "prediction_id": i, "predictions": "".join(toks), "predictions_tokenised": ", ".join(toks),
-                "log_probs": sum(lps), "token_log_probs": str([round(x, 5) for x in lps]), "delta_mass_ppm": 0.0,
-            }
-            for b, (bt, bl) in enumerate(beams):
-                row[f"predictions_beam_{b}"] = "".join(bt)
-                row[f"predictions_log_probability_beam_{b}"] = sum(bl)
-                row[f"predictions_token_log_probabilities_beam_{b}"] = str([round(x, 5) for x in bl])
-            w.writerow(row)
-
-    return {"proteins": len(proteins), "peptides": len(peptides), "spectra": len(spectra)}
+            truth.write(f"{ename}\t{i}\t{name}\t{start + 1}\t{pep}\n")
+        _write_casanovo(outdir / f"casanovo_{ename}.mztab", spectra, rng, sp, enz, noise)
+        _write_instanovo(outdir / f"instanovo_{ename}.csv", spectra, rng, sp, enz, noise)
+        lens = [len(p[2]) for p in peptides]
+        info["enzymes"][ename] = {
+            "distinct_peptides": len(peptides),
+            "spectra": len(spectra),
+            "peptides_observed": len({(n, st, p) for n, st, p in spectra}),
+            "median_len": sorted(lens)[len(lens) // 2] if lens else 0,
+        }
+    truth.close()
+    return info

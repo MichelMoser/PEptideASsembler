@@ -16,7 +16,7 @@ from .io import read_casanovo, read_fasta, read_instanovo
 from .olc import OLCParams
 from .polish import PolishParams
 from .preprocess import PreprocessParams
-from .simulate import SimParams, simulate
+from .simulate import DEFAULT_ENZYMES, ENZYMES, SimParams, simulate
 from .tokens import Alphabet
 
 
@@ -73,8 +73,8 @@ def cmd_assemble(a: argparse.Namespace) -> int:
 
 
 def cmd_simulate(a: argparse.Namespace) -> int:
-    sp = SimParams(seed=a.seed, protein_length=a.length, mean_spectra_per_peptide=a.depth,
-                   sub_rate=a.sub_rate)
+    sp = SimParams(seed=a.seed, protein_length=a.length, spectra_per_residue=a.depth,
+                   sub_rate=a.sub_rate, enzymes=tuple(a.enzymes), copies=a.copies)
     info = simulate(a.output, sp, a.reference)
     _log(f"simulated {info} -> {a.output}")
     return 0
@@ -148,8 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-o", "--output", required=True)
     s.add_argument("--reference", help="protein FASTA (default: random protein)")
     s.add_argument("--length", type=int, default=300)
-    s.add_argument("--depth", type=float, default=3.0, help="mean spectra per peptide")
-    s.add_argument("--sub-rate", type=float, default=0.04)
+    s.add_argument("--depth", type=float, default=1.5,
+                   help="spectra per digest = depth x total protein length (one LC-MS run per enzyme)")
+    s.add_argument("--sub-rate", type=float, default=0.04, help="base per-residue substitution rate (scaled per enzyme)")
+    s.add_argument("--enzymes", nargs="+", default=list(DEFAULT_ENZYMES), choices=sorted(ENZYMES),
+                   help="one digest (file pair) per enzyme")
+    s.add_argument("--copies", type=int, default=200, help="protein molecules digested per enzyme")
     s.add_argument("--seed", type=int, default=1)
     s.set_defaults(func=cmd_simulate)
 

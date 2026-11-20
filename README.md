@@ -100,26 +100,43 @@ parse → weight candidates → trim/filter → collapse identical peptides (uni
 | `graph_k*.gfa`      | cleaned de Bruijn graph unitigs (view in Bandage)                                |
 | `run.json`          | parameters and per-stage statistics                                              |
 
-## Simulated benchmark (v0.1)
+## Simulated benchmark
 
-`peas simulate` models typical de novo errors:
+`peas simulate` digests the reference **probabilistically** with each protease and writes one mzTab/CSV pair per digest, as each digest is normally its own LC-MS run. Every digest gets the same spectrum budget, spread over peptides by abundance × detectability.
+
+| digest (`--enzymes`) | cleavage model | de novo error multiplier |
+|---|---|---|
+| `trypsin_lysc` | after K (also K-P, Lys-C) and R (not R-P) | 1.0 |
+| `chymotrypsin` | after F/Y/W (high), L/M (low), not before P | 1.5 |
+| `gluc` | after E, some after D | 1.5 |
+| `proteinase_k` | broad: after aliphatic/aromatic residues, high background | 2.0 |
+| `trypsin`, `lysc`, `aspn` | also available | |
+
+The error multiplier reflects that Casanovo and InstaNovo are trained mostly on tryptic data. Non-tryptic digests also get more *confidently wrong* residues. The error model:
 - I/L chosen at random
-- near-isobaric substitutions (K/Q, N/D, F/M), some of them with high confidence
+- near-isobaric substitutions (K/Q, N/D, F/M)
 - adjacent residue swaps
 - N ↔ GG
 - higher error rates at the peptide termini
 - garbage predictions
 
-The test set is 4 proteins, 1,490 aa in total; two of them are ~87% identical homologues. Four proteases, ~3 spectra per peptide, both tools.
+The test set is 4 proteins, 1,490 aa in total; two of them are ~87% identical homologues. Each digest has ~2,600 spectra, and both tools are used. All runs are in hybrid mode.
 
-| mode   | per-residue error | contigs | reference coverage | identity | N50 |
-|--------|-------------------|---------|--------------------|----------|-----|
-| dbg    | 4%                | 6       | 0.83               | 0.982    | 348 |
-| olc    | 4%                | 21      | 0.95               | 0.972    | 129 |
-| hybrid | 4%                | 12      | 0.95               | 0.976    | 407 |
-| hybrid | 8%                | 19      | 0.88               | 0.969    | 166 |
+| digests | contigs | reference coverage | identity | N50 |
+|---|---|---|---|---|
+| Trypsin/Lys-C | 58 | 0.72 | 0.985 | 28 |
+| proteinase K | 19 | 0.84 | 0.966 | 168 |
+| Trypsin/Lys-C + chymotrypsin | 19 | 0.84 | 0.980 | 116 |
+| + Glu-C | 19 | 0.83 | 0.965 | 194 |
+| Trypsin/Lys-C + proteinase K | 25 | 0.85 | 0.955 | 450 |
+| all four | 35 | 0.89 | 0.964 | 220 |
 
-The single 300-aa protein assembles into one contig at 100% identity (dbg and hybrid). Run time is a few seconds for ~10k predictions. Coverage lost in dbg mode is mostly the homologue pair, which bubble popping collapses.
+Main findings:
+- **The assembler doesn't need to know the enzyme.** It only sees overlapping peptides.
+- **Orthogonal digests create the overlaps across cleavage sites.** A single tryptic digest cannot be assembled into long contigs.
+- **Proteinase K tiles the protein like shotgun reads.** Even on its own it gives long contigs, but it adds the most noise.
+- **The two unique proteins are fully reconstructed** by any combination of two or more digests.
+- **The loss of coverage comes from the homologous pair.**
 
 ## Known limitations / next steps
 
